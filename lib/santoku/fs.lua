@@ -1,414 +1,446 @@
--- TODO: Add asserts
--- TODO: fs.parse
+local err = require("santoku.error")
+local wrapnil = err.wrapnil
+local error = err.error
+local pcall = err.pcall
+local assert = err.assert
 
-local compat = require("santoku.compat")
+local lua = require("santoku.lua")
+local load = lua.load
+
 local inherit = require("santoku.inherit")
+local pushindex = inherit.pushindex
+
+local validate = require("santoku.validate")
+local hasargs = validate.hasargs
+local hascall = validate.hascall
+local hasindex = validate.hasindex
+local ge = validate.ge
+local isstring = validate.isstring
+local isboolean = validate.isboolean
+local isnumber = validate.isnumber
+
 local str = require("santoku.string")
-local check = require("santoku.check")
-local gen = require("santoku.gen")
-local tup = require("santoku.tuple")
-local fun = require("santoku.fun")
-local vec = require("santoku.vector")
+local ssplit = str.split
+local ssub = str.sub
+local sfind = str.find
+
+local fun = require("santoku.functional")
+local noop = fun.noop
+
+local tbl = require("santoku.table")
+local tassign = tbl.assign
+
+local iter = require("santoku.iter")
+local idrop = iter.drop
+local itail = iter.tail
+local ifilter = iter.filter
+local ifirst = iter.first
+local ilast = iter.last
+
+local arr = require("santoku.array")
+local acat = arr.concat
+
+local varg = require("santoku.varg")
+local vreduce = varg.reduce
+local vtup = varg.tup
+
+local _open = io.open
+local _close = io.close
+local _read = io.read
+local _write = io.write
+local _flush = io.flush
+local _stdout = io.stdout
+local _stderr = io.stderr
+local _stdin = io.stdin
+local _tmpname = os.tmpname
 
 local posix = require("santoku.fs.posix")
+local ENOENT = posix.ENOENT
+local EEXIST = posix.EEXIST
+local mkdir = posix.mkdir
+local rmdir = posix.rmdir
+local mode = posix.mode
+local diropen = posix.diropen
+local dirent = posix.dirent
+local next_chunk = posix.next_chunk
 
-local M = {}
+local tmpname = wrapnil(_tmpname)
+local open = wrapnil(_open)
+local close = _close
+local read = wrapnil(_read)
+local write = wrapnil(_write)
 
-for k, v in pairs(posix) do
-  M[k] = v
-end
-
-M.mkdirp = function (dir)
-  local p0 = str.startswith(dir, M.pathdelim) and M.pathdelim or nil
-  for p1 in dir:gmatch("([^" .. str.escape(M.pathdelim) .. "]+)/?") do
-    if p0 then
-      p1 = M.join(p0, p1)
+-- TODO: Accept handle or filepath
+local function chunks (handle, delims, size, omit)
+  local chunk, ss, se, ds, de
+  return function ()
+    chunk, ss, se, ds, de = next_chunk(handle, delims, size, chunk, ss, se, ds, de)
+    if chunk then
+      return chunk, ss, omit and se or de
+    else
+      close(handle)
     end
-    p0 = p1
-    local ok, err, code = M.mkdir(p1)
-    if not ok and code ~= M.EEXIST then
-      return ok, err, code
+  end
+end
+
+local function lines (handle, size)
+  return chunks(handle, "\r\n", size, true)
+end
+
+local function join (...)
+  assert(hasargs(...))
+  local hastrailing = false
+  return acat(vreduce(function (a, n)
+    assert(isstring(n))
+    if not a[1] then
+      a[1] = n
+    elseif hastrailing or sfind(n, "^/") then
+      a[#a + 1] = n
+    else
+      a[#a + 1] = "/"
+      a[#a + 1] = n
+    end
+    hastrailing = sfind(n, "/$")
+    return a
+  end, {}, ...))
+end
+
+local function dirname (fp)
+  assert(isstring(fp))
+  local s, e = sfind(fp, "^.*/")
+  if not s then
+    return "."
+  else
+    return ssub(fp, s, e - 1)
+  end
+end
+
+local function basename (fp)
+  assert(isstring(fp))
+  local s, e = sfind(fp, "^.*/")
+  if not s then
+    return fp
+  elseif e == #fp then
+    return nil
+  else
+    return ssub(fp, e + 1)
+  end
+end
+
+local function extension (fp, all)
+  assert(isstring(fp))
+  local s, e = sfind(fp, "^.*/")
+  e = s and e + 1 or 1
+  s, e = sfind(fp, all and "%..*$" or "%.[^.]*$", e)
+  return s and ssub(fp, s, e) or nil
+end
+
+local function extensions (fp)
+  assert(isstring(fp))
+  return extension(fp, true)
+end
+
+local function stripextension (fp, all)
+  assert(isstring(fp))
+  local s = sfind(fp, all and "%..*$" or "%.[^.]*$")
+  if s then
+    return ssub(fp, 1, s - 1)
+  else
+    return fp
+  end
+end
+
+local function stripextensions (fp)
+  assert(isstring(fp))
+  return stripextension(fp, true)
+end
+
+local function _string_is_zero_len (_, s, e)
+  return e >= s
+end
+
+local function splitparts (fp, delim)
+  assert(isstring(fp))
+  return ifilter(_string_is_zero_len, ssplit(fp, "/+", delim))
+end
+
+local function splitexts (fp, keep_dots)
+  assert(isstring(fp))
+  local s = sfind(fp, "%..*$")
+  if not s then
+    return noop
+  else
+    return itail(ssplit(fp, "%.", keep_dots and "right" or false, s))
+  end
+end
+
+local function stripparts (fp, n, keep_sep)
+  assert(isstring(fp))
+  assert(isnumber(n))
+  assert(ge(n, 0))
+  if n == 0 then
+    return fp
+  end
+  return vtup(function (...)
+    local _, s0, e0 = ifirst(...)
+    local _, s1, e1 = ilast(...)
+    if s0 and not s1 then
+      return ssub(fp, s0, e0)
+    elseif s0 and e1 then
+      return ssub(fp, s0, e1)
+    end
+  end, idrop(n, ifilter(function (str, s, e)
+    if e < s then
+      return false
+    else
+      local s0, e0 = sfind(str, "/+", s)
+      return not s0 or not (s0 == s and e0 == e)
+    end
+  end, ssplit(fp, "/+", keep_sep and "right" or "left"))))
+end
+
+local function dir (fp)
+  local d = diropen(fp)
+  return function ()
+    local f, m = dirent(d)
+    if f then
+      return f, m
     end
   end
-  return true
 end
 
-M.isdir = function (fp)
-  local ok, mode, cd = M.mode(fp)
-  if not ok and cd == M.ENOENT then
-    return true, false
-  elseif not ok then
-    return false, mode, cd
-  else
-    return true, mode == "directory"
-  end
-end
+-- TODO: Breadth-first traversal
+-- TODO: Close all dirs on error
+-- TODO: Would offloading path joins to C be helpful? Or will we need to create
+-- new strings regardless? Perhaps this function shouldn't concat strings at
+-- all?
+local function walk (fp, prune, leaves)
 
-M.isfile = function (fp)
-  local ok, mode, cd = M.mode(fp)
-  if not ok then
-    return false, mode, cd
-  else
-    return true, mode == "file"
-  end
-end
+  assert(isstring(fp))
+  prune = prune or noop
+  assert(hascall(prune))
+  leaves = leaves or false
+  assert(isboolean(leaves))
 
-M.exists = function (fp)
-  local ok, mode, code = M.mode(fp)
-  if not ok and code == M.ENOENT then
-    return true, false
-  elseif ok then
-    return true, true, mode
-  else
-    return false, mode, code
-  end
-end
+  local names = { fp }
+  local stack = { dir(fp) }
+  local modes = {}
 
-M.dir = function (dir)
-  local ok, entries, cd = posix.dir(dir)
-  if not ok then
-    return false, entries, cd
-  else
-    return true, gen(function (yield)
-      while true do
-        local ok, name, mode = entries()
-        if not ok then
-          yield(false, name, mode)
-          break
-        elseif ok and name then
-          yield(true, name, mode)
+  local function helper ()
+    local ents = stack[#stack]
+    if not ents then
+      return
+    elseif type(ents) == "string" then
+      local mode = modes[#stack]
+      modes[#stack] = nil
+      stack[#stack] = nil
+      return ents, mode
+    end
+    local name, mode = ents()
+    if not name then
+      stack[#stack] = nil
+      return helper()
+    elseif name == ".." or name == "." then
+      return helper()
+    else
+      name = join(names[#stack], name)
+      if mode == "file" then
+        return name, mode
+      elseif mode == "directory" then
+        local shouldprune = prune(name, mode)
+        if not shouldprune then
+          if not leaves then
+            stack[#stack + 1] = dir(name)
+            names[#stack] = name
+            return name, mode
+          else
+            stack[#stack + 1] = name
+            modes[#stack] = mode
+            stack[#stack + 1] = dir(name)
+            return helper()
+          end
+        elseif shouldprune == "keep" then
+          return name, mode
         else
-          break
+          return helper()
         end
       end
-    end)
+    end
+  end
+
+  return helper
+
+end
+
+local function files (fp, recurse)
+  return ifilter(function (_, m)
+    return m == "file"
+  end, walk(fp, not recurse and function (_, m)
+    return m == "directory"
+  end))
+end
+
+local function dirs (fp, recurse, leaves)
+  return ifilter(function (_, m)
+    return m == "directory"
+  end, walk(fp, not recurse and function (_, m)
+    return m == "directory" and "keep"
+  end, leaves))
+end
+
+local function isdir (fp)
+  return vtup(function (ok, mode, code, ...)
+    if (not ok and code == ENOENT) or (ok and mode ~= "directory") then
+      return false
+    elseif not ok then
+      return error(mode, code, ...)
+    else
+      return true
+    end
+  end, pcall(mode, fp))
+end
+
+local function isfile (fp)
+  return vtup(function (ok, mode, code, ...)
+    if (not ok and code == ENOENT) or (ok and mode ~= "file") then
+      return false
+    elseif not ok then
+      return error(mode, code, ...)
+    else
+      return true
+    end
+  end, pcall(mode, fp))
+end
+
+local function exists (fp)
+  return vtup(function (ok, mode, code, ...)
+    if not ok and code == ENOENT then
+      return false
+    elseif ok then
+      return true, mode
+    else
+      return error(mode, code, ...)
+    end
+  end, pcall(mode, fp))
+end
+
+local function mkdirp (fp)
+  assert(isstring(fp))
+  local s0 = nil
+  for str, s, e in splitparts(fp, "right") do
+    s0 = s0 or s
+    local dir = ssub(str, s0, e)
+    local ok, err, cd = pcall(mkdir(s0))
+    if not ok and cd ~= EEXIST then
+      error(err, cd, dir)
+    end
   end
 end
 
--- TODO: Breadth vs depth, default to depth so
--- that directory contents are returned before
--- directories themselves
--- TODO: Reverse arg order, allow multiple dirs
-M.walk = function (dir, opts)
-  local prune = (opts or {}).prune or compat.const(false)
-  local prunekeep = (opts or {}).prunekeep or false
-  local leaves = (opts or {}).leaves or false
-  return gen(function (each)
-    local ok, entries, cd = M.dir(dir)
+local function rm (fp, allow_noexist)
+  assert(isstring(fp))
+  allow_noexist = allow_noexist or false
+  assert(isboolean(allow_noexist))
+  return vtup(function (ok, err, cd, ...)
+    if not ok and (not allow_noexist and cd == ENOENT) then
+      return error(err, cd, ...)
+    end
+  end, os.remove(fp))
+end
+
+local function mv (old, new)
+  assert(isstring(old))
+  assert(isstring(new))
+  return vtup(function (ok, ...)
     if not ok then
-      return each(false, entries, cd)
-    else
-      return entries:each(function (ok, name, mode)
-        if not ok then
-          return each(false, name, mode)
-        end
-        if name ~= M.dirparent and name ~= M.dirthis then
-          name = M.join(dir, name)
-          if mode == "directory" then
-            if not prune(name, mode) then
-              if not leaves then
-                each(true, name, mode)
-                return M.walk(name, opts):each(each)
-              else
-                M.walk(name, opts):each(each)
-                return each(true, name, mode)
-              end
-            elseif prunekeep then
-              return each(true, name, mode)
-            end
-          else
-            return each(true, name, mode)
-          end
-        end
-      end)
+      return error(...)
     end
   end)
 end
 
--- TODO: Avoid pcall by using io.open/read
--- directly. Potentially use __gc on the
--- coroutine to ensure the file gets closed.
--- Provide binary t/f, chunk size, max line
--- size, max file size, how to handle overunning
--- max line size, etc.
--- TODO: Need a way to abort this iterator and close the file
-M.lines = function (fp)
-  local ok, iter, cd = pcall(io.lines, fp)
-  if ok then
-    return true, gen.iter(iter)
-  else
-    return false, iter, cd
+local function rmdirs (dir)
+  assert(isstring(dir))
+  for _, d in dirs(dir, true, true) do
+    rmdir(d)
   end
-end
-
--- TODO: Reverse arg order, allow multiple dirs
-M.files = function (dir, opts)
-  local recurse = (opts or {}).recurse
-  local walkopts = {}
-  if not recurse then
-    walkopts.prune = function (_, mode)
-      return mode == "directory"
-    end
-  end
-  return M.walk(dir, walkopts)
-    :filter(function (ok, _, mode)
-      return not ok or mode == "file"
-    end)
-end
-
--- TODO: Reverse arg order, allow multiple dirs
-M.dirs = function (dir, opts)
-  local recurse = (opts or {}).recurse
-  local leaves = (opts or {}).leaves
-  local walkopts = { prunekeep = true, leaves = leaves }
-  if not recurse then
-    walkopts.prune = function (_, mode)
-      return mode == "directory"
-    end
-  end
-  return M.walk(dir, walkopts)
-    :filter(function (ok, _, mode)
-      return not ok or mode == "directory"
-    end)
-end
-
--- TODO: Dynamically figure this out for each OS.
--- TODO: Does every OS have a singe-char path delim? If not,
--- some functions below will fail.
--- TODO: Does every OS use the same identifier as both
--- delimiter and root indicator?
-M.pathdelim = "/"
-M.pathroot = "/"
-M.dirparent = ".."
-M.dirthis = "."
-
-M.basename = function (fp)
-  if not fp:match(str.escape(M.pathdelim)) then
-    return fp
-  else
-    local parts = str.split(fp, M.pathdelim)
-    return parts[parts.n]
-  end
-end
-
-M.dirname = function (fp)
-  local parts = str.split(fp, M.pathdelim, { delim = "left" })
-  local dir = table.concat(parts, "", 1, parts.n - 1):gsub("/$", "")
-  if dir == "" then
-    return "."
-  else
-    return dir
-  end
-end
-
-M.join = function (...)
-  return M.joinwith(M.pathdelim, ...)
-end
-
-M.joinwith = function (d, ...)
-  local de = str.escape(d)
-  -- TODO: Does this pattern work with
-  -- delimiters longer than 1 char?
-  local pat = string.format("%s*$", de)
-  local clean = fun.bindl(tup.map, fun.bindr(string.gsub, pat, ""))
-  local filter = fun.bindl(tup.filter, compat.id)
-  local interleave = fun.bindl(tup.interleave, d)
-  return tup.concat(interleave(clean(filter(...))))
-end
-
-M.splitparts = function (fp, opts)
-  return str.split(fp, M.pathdelim, opts)
-end
-
-M.stripextension = function (fp)
-  local parts = M.splitparts(fp)
-  local last = parts[parts.n]
-  last = string.match(last, "(.*)%..*") or last
-  parts[parts.n] = last
-  return table.concat(parts, M.pathdelim)
-end
-
-M.stripextensions = function (fp)
-  local parts = M.splitparts(fp)
-  local last = parts[parts.n]
-  local idot = string.find(last, "%.")
-  if idot then
-    last = last:sub(1, idot - 1)
-  end
-  parts[parts.n] = last
-  return table.concat(parts, M.pathdelim)
-end
-
-M.extension = function (fp)
-  fp = M.basename(fp)
-  return (string.match(fp, ".*%.(.*)"))
-end
-
-M.extensions = function (fp)
-  fp = M.basename(fp)
-  local idot = string.find(fp, "%.")
-  if idot then
-    return fp:sub(idot + 1, fp:len())
-  end
-end
-
--- TODO: Can probably improve performance by not
--- splitting so much. Perhaps we need an isplit
--- function that just returns indices?
-M.splitexts = function (fp)
-  local parts = M.splitparts(fp, { delim = "left" })
-  local last = str.split(parts[parts.n], "%.", { delim = "right" })
-  local lasti = 1
-  if last[1] == "" then
-    lasti = 2
-  end
-  return {
-    exts = last:slice(lasti + 1),
-    name = table.concat(parts, "", 1, parts.n - 1)
-        .. table.concat(last, "", lasti, 1)
-  }
 end
 
 -- TODO: Can we leverage a generalized function
 -- for this?
-M.writefile = function (fp, str, flag)
+-- TODO: catch errors and close handle
+local function writefile (fp, str, flag)
+  assert(isstring(fp))
+  assert(isstring(str))
   flag = flag or "w"
-  assert(type(flag) == "string")
-  local fh, err
-  if fp == io.stdout then
-    fh = io.stdout
-  else
-    fh, err = io.open(fp, flag)
-  end
-  if not fh then
-    return false, err
-  else
-    fh:write(str)
-    fh:flush()
-    if fh ~= io.stdout then
-      fh:close()
-    end
-    return true
+  assert(isstring(flag))
+  local fh = fp == _stdout and _stdout or open(fp, flag)
+  write(fh, str)
+  _flush(fh)
+  if fh ~= _stdout then
+    close(fh)
   end
 end
 
--- TODO: Leverage fs.chunks or fs.parse
-M.readfile = function (fp, flag)
+-- TODO: catch errors and close handle
+local function readfile (fp, flag)
+  assert(isstring(fp))
   flag = flag or "r"
-  assert(type(flag) == "string")
-  local fh, err
-  if fp == io.stdin then
-    fh = io.stdin
-  else
-    fh, err = io.open(fp, flag)
+  assert(isstring(flag))
+  local fh = fp == _stdin and _stdin or open(fp, flag)
+  local content = read(fp, "*all")
+  if fh ~= _stdin then
+    close(fh)
   end
-  if not fh then
-    return false, err
-  else
-    local content = fh:read("*all")
-    if fh ~= io.stdin then
-      fh:close()
-    end
-    return true, content
-  end
+  return content
 end
 
-M.tmpfile = function ()
-  local fp, err = os.tmpname()
-  if not fp then
-    return false, err
-  else
-    return true, fp
-  end
+local function loadfile (fp, env)
+  return load(readfile(fp), env)
 end
 
-M.rm = function (fp, allow_noexist)
-  local ok, err, cd = os.remove(fp)
-  if not ok and (not allow_noexist and cd == M.ENOENT) then
-    return false, err, cd
-  else
-    return true
-  end
+local function runfile (fp, env, nog)
+  assert(isstring(fp))
+  env = env or {}
+  assert(hascall(env) or hasindex(env))
+  local lenv = nog and env or pushindex(env, _G)
+  return loadfile(fp, lenv)()
 end
 
-M.mv = function (old, new)
-  local ret = tup(os.rename(old, new))
-  if not ret() then
-    return false, tup.sel(2, ret())
-  else
-    return true
-  end
-end
-
-M.rmdirs = function (dir)
-  return check:wrap(function (check)
-    M.dirs(dir, { recurse = true, leaves = true })
-      :map(check)
-      :map(M.rmdir)
-      :each(check)
-  end)
-end
-
-M.absolute = function (fp)
-  if fp:sub(1, 1) == M.pathroot then
-    return M.normalize(fp)
-  elseif fp:sub(1, 2) == "~/" then
-    local home = os.getenv("HOME")
-    if not home then
-      return false, "No home directory"
-    else
-      fp = M.join(home, fp:sub(2))
-    end
-  else
-    local ok, dir, cd = M.cwd()
-    if not ok then
-      return false, dir, cd
-    else
-      fp = M.join(dir, fp)
-    end
-  end
-  return M.normalize(fp)
-end
-
-M.normalize = function (fp)
-  assert(type(fp) == "string")
-  fp = fp:match("^/*(.*)$")
-  local parts = str.split(fp, M.pathdelim)
-  local parts0 = vec()
-  for i = 1, parts.n do
-    if parts0.n == 0 and parts[i] == ".." then
-      return false, "Can't move past root with '..'"
-    elseif parts[i] == ".." then
-      parts0:pop()
-    elseif parts[i] ~= "." and parts[i] ~= "" then
-      parts0:append(parts[i])
-    end
-  end
-  fp = M.join(parts0:unpack())
-  if fp == "" then
-    return true, "."
-  else
-    return true, M.pathroot .. fp
-  end
-end
-
-M.loadfile = function (fp, env)
-  local ret = tup(M.readfile(fp))
-  if not ret() then
-    return ret()
-  else
-    return compat.load(tup.sel(2, ret()), env)
-  end
-end
-
-M.runfile = function (fp, env)
-  local lenv = inherit.pushindex(env or {}, _G)
-  local ret = tup(M.loadfile(fp, lenv))
-  if not ret() then
-    return ret()
-  else
-    return pcall((tup.sel(2, ret())))
-  end
-end
-
-return M
+return tassign({}, posix, {
+  open = open,
+  close = close,
+  read = read,
+  write = write,
+  flush = _flush,
+  stdout = _stdout,
+  stderr = _stderr,
+  stdin = _stdin,
+  exists = exists,
+  mkdirp = mkdirp,
+  rm = rm,
+  mv = mv,
+  rmdirs = rmdirs,
+  writefile = writefile,
+  readfile = readfile,
+  loadfile = loadfile,
+  runfile = runfile,
+  tmpname = tmpname,
+  isdir = isdir,
+  isfile = isfile,
+  join = join,
+  dirname = dirname,
+  basename = basename,
+  extension = extension,
+  extensions = extensions,
+  stripextension = stripextension,
+  stripextensions = stripextensions,
+  splitparts = splitparts,
+  splitexts = splitexts,
+  stripparts = stripparts,
+  chunks = chunks,
+  lines = lines,
+  dir = dir,
+  walk = walk,
+  files = files,
+  dirs = dirs,
+})
